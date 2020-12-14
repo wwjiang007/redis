@@ -56,6 +56,7 @@
 #include <sys/utsname.h>
 #include <locale.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 
 /* Our shared "common" objects */
 
@@ -436,19 +437,27 @@ struct redisCommand redisCommandTable[] = {
 
     {"zunionstore",zunionstoreCommand,-4,
      "write use-memory @sortedset",
-     0,zunionInterStoreGetKeys,0,0,0,0,0,0},
+     0,zunionInterDiffStoreGetKeys,0,0,0,0,0,0},
 
     {"zinterstore",zinterstoreCommand,-4,
      "write use-memory @sortedset",
-     0,zunionInterStoreGetKeys,0,0,0,0,0,0},
+     0,zunionInterDiffStoreGetKeys,0,0,0,0,0,0},
+
+    {"zdiffstore",zdiffstoreCommand,-4,
+     "write use-memory @sortedset",
+     0,zunionInterDiffStoreGetKeys,0,0,0,0,0,0},
 
     {"zunion",zunionCommand,-3,
      "read-only @sortedset",
-     0,zunionInterGetKeys,0,0,0,0,0,0},
+     0,zunionInterDiffGetKeys,0,0,0,0,0,0},
 
     {"zinter",zinterCommand,-3,
      "read-only @sortedset",
-     0,zunionInterGetKeys,0,0,0,0,0,0},
+     0,zunionInterDiffGetKeys,0,0,0,0,0,0},
+
+    {"zdiff",zdiffCommand,-3,
+     "read-only @sortedset",
+     0,zunionInterDiffGetKeys,0,0,0,0,0,0},
 
     {"zrange",zrangeCommand,-4,
      "read-only @sortedset",
@@ -621,6 +630,10 @@ struct redisCommand redisCommandTable[] = {
     {"move",moveCommand,3,
      "write fast @keyspace",
      0,NULL,1,1,1,0,0,0},
+
+    {"copy",copyCommand,-3,
+     "write use-memory @keyspace",
+     0,NULL,1,2,1,0,0,0},
 
     /* Like for SET, we can't mark rename as a fast command because
      * overwriting the target key may result in an implicit slow DEL. */
@@ -907,7 +920,7 @@ struct redisCommand redisCommandTable[] = {
 
     /* GEORADIUS has store options that may write. */
     {"georadius",georadiusCommand,-6,
-     "write @geo",
+     "write use-memory @geo",
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadius_ro",georadiusroCommand,-6,
@@ -915,7 +928,7 @@ struct redisCommand redisCommandTable[] = {
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadiusbymember",georadiusbymemberCommand,-5,
-     "write @geo",
+     "write use-memory @geo",
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadiusbymember_ro",georadiusbymemberroCommand,-5,
@@ -933,6 +946,14 @@ struct redisCommand redisCommandTable[] = {
     {"geodist",geodistCommand,-4,
      "read-only @geo",
      0,NULL,1,1,1,0,0,0},
+
+    {"geosearch",geosearchCommand,-7,
+     "read-only @geo",
+      0,NULL,1,1,1,0,0,0},
+
+    {"geosearchstore",geosearchstoreCommand,-8,
+     "write use-memory @geo",
+      0,NULL,1,2,1,0,0,0},
 
     {"pfselftest",pfselftestCommand,1,
      "admin @hyperloglog",
@@ -1286,6 +1307,20 @@ uint64_t dictEncObjHash(const void *key) {
     }
 }
 
+/* Return 1 if currently we allow dict to expand. Dict may allocate huge
+ * memory to contain hash buckets when dict expands, that may lead redis
+ * rejects user's requests or evicts some keys, we can stop dict to expand
+ * provisionally if used memory will be over maxmemory after dict expands,
+ * but to guarantee the performance of redis, we still allow dict to expand
+ * if dict load factor exceeds HASHTABLE_MAX_LOAD_FACTOR. */
+int dictExpandAllowed(size_t moreMem, double usedRatio) {
+    if (usedRatio <= HASHTABLE_MAX_LOAD_FACTOR) {
+        return !overMaxmemoryAfterAlloc(moreMem);
+    } else {
+        return 1;
+    }
+}
+
 /* Generic hash table type where keys are Redis Objects, Values
  * dummy pointers. */
 dictType objectKeyPointerValueDictType = {
@@ -1294,7 +1329,8 @@ dictType objectKeyPointerValueDictType = {
     NULL,                      /* val dup */
     dictEncObjKeyCompare,      /* key compare */
     dictObjectDestructor,      /* key destructor */
-    NULL                       /* val destructor */
+    NULL,                      /* val destructor */
+    NULL                       /* allow to expand */
 };
 
 /* Like objectKeyPointerValueDictType(), but values can be destroyed, if
@@ -1305,7 +1341,8 @@ dictType objectKeyHeapPointerValueDictType = {
     NULL,                      /* val dup */
     dictEncObjKeyCompare,      /* key compare */
     dictObjectDestructor,      /* key destructor */
-    dictVanillaFree            /* val destructor */
+    dictVanillaFree,           /* val destructor */
+    NULL                       /* allow to expand */
 };
 
 /* Set dictionary type. Keys are SDS strings, values are not used. */
@@ -1325,7 +1362,8 @@ dictType zsetDictType = {
     NULL,                      /* val dup */
     dictSdsKeyCompare,         /* key compare */
     NULL,                      /* Note: SDS string shared & freed by skiplist */
-    NULL                       /* val destructor */
+    NULL,                      /* val destructor */
+    NULL                       /* allow to expand */
 };
 
 /* Db->dict, keys are sds strings, vals are Redis objects. */
@@ -1335,7 +1373,8 @@ dictType dbDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCompare,          /* key compare */
     dictSdsDestructor,          /* key destructor */
-    dictObjectDestructor   /* val destructor */
+    dictObjectDestructor,       /* val destructor */
+    dictExpandAllowed           /* allow to expand */
 };
 
 /* server.lua_scripts sha (as sds string) -> scripts (as robj) cache. */
@@ -1345,17 +1384,19 @@ dictType shaScriptObjectDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    dictObjectDestructor        /* val destructor */
+    dictObjectDestructor,       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Db->expires */
-dictType keyptrDictType = {
+dictType dbExpiresDictType = {
     dictSdsHash,                /* hash function */
     NULL,                       /* key dup */
     NULL,                       /* val dup */
     dictSdsKeyCompare,          /* key compare */
     NULL,                       /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    dictExpandAllowed           /* allow to expand */
 };
 
 /* Command table. sds string -> command struct pointer. */
@@ -1365,7 +1406,8 @@ dictType commandTableDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Hash type hash table (note that small hashes are represented with ziplists) */
@@ -1375,7 +1417,8 @@ dictType hashDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCompare,          /* key compare */
     dictSdsDestructor,          /* key destructor */
-    dictSdsDestructor           /* val destructor */
+    dictSdsDestructor,          /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Keylist hash table type has unencoded redis objects as keys and
@@ -1387,7 +1430,8 @@ dictType keylistDictType = {
     NULL,                       /* val dup */
     dictObjKeyCompare,          /* key compare */
     dictObjectDestructor,       /* key destructor */
-    dictListDestructor          /* val destructor */
+    dictListDestructor,         /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
@@ -1398,7 +1442,8 @@ dictType clusterNodesDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCompare,          /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Cluster re-addition blacklist. This maps node IDs to the time
@@ -1410,7 +1455,8 @@ dictType clusterNodesBlackListDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Modules system dictionary type. Keys are module name,
@@ -1421,7 +1467,8 @@ dictType modulesDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Migrate cache dict type. */
@@ -1431,7 +1478,8 @@ dictType migrateCacheDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCompare,          /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* Replication cached script dict (server.repl_scriptcache_dict).
@@ -1443,7 +1491,8 @@ dictType replScriptCacheDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 int htNeedsResize(dict *dict) {
@@ -1603,7 +1652,8 @@ size_t ClientsPeakMemInput[CLIENTS_PEAK_MEM_USAGE_SLOTS];
 size_t ClientsPeakMemOutput[CLIENTS_PEAK_MEM_USAGE_SLOTS];
 
 int clientsCronTrackExpansiveClients(client *c) {
-    size_t in_usage = sdsZmallocSize(c->querybuf) + c->argv_len_sum;
+    size_t in_usage = sdsZmallocSize(c->querybuf) + c->argv_len_sum +
+	              (c->argv ? zmalloc_size(c->argv) : 0);
     size_t out_usage = getClientOutputBufferMemoryUsage(c);
     int i = server.unixtime % CLIENTS_PEAK_MEM_USAGE_SLOTS;
     int zeroidx = (i+1) % CLIENTS_PEAK_MEM_USAGE_SLOTS;
@@ -2294,15 +2344,17 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Close clients that need to be closed asynchronous */
     freeClientsInAsyncFreeQueue();
 
+    /* Try to process blocked clients every once in while. Example: A module
+     * calls RM_SignalKeyAsReady from within a timer callback (So we don't
+     * visit processCommand() at all). */
+    handleClientsBlockedOnKeys();
+
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. Redis main thread will not touch anything at this
      * time. */
     if (moduleCount()) moduleReleaseGIL();
 
-    /* Try to process blocked clients every once in while. Example: A module
-     * calls RM_SignalKeyAsReady from within a timer callback (So we don't
-     * visit processCommand() at all). */
-    handleClientsBlockedOnKeys();
+    /* Do NOT add anything below moduleReleaseGIL !!! */
 }
 
 /* This function is called immediately after the event loop multiplexing
@@ -2311,6 +2363,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 void afterSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* Do NOT add anything above moduleAcquireGIL !!! */
+
+    /* Aquire the modules GIL so that their threads won't touch anything. */
     if (!ProcessingEventsWhileBlocked) {
         if (moduleCount()) moduleAcquireGIL();
     }
@@ -2460,6 +2515,7 @@ void initServerConfig(void) {
     server.tlsfd_count = 0;
     server.sofd = -1;
     server.active_expire_enabled = 1;
+    server.skip_checksum_validation = 0;
     server.client_max_querybuf_len = PROTO_MAX_QUERYBUF_LEN;
     server.saveparams = NULL;
     server.loading = 0;
@@ -2655,7 +2711,7 @@ static void readOOMScoreAdj(void) {
  */
 int setOOMScoreAdj(int process_class) {
 
-    if (!server.oom_score_adj) return C_OK;
+    if (server.oom_score_adj == OOM_SCORE_ADJ_NO) return C_OK;
     if (process_class == -1)
         process_class = (server.masterhost ? CONFIG_OOM_REPLICA : CONFIG_OOM_MASTER);
 
@@ -2666,7 +2722,9 @@ int setOOMScoreAdj(int process_class) {
     int val;
     char buf[64];
 
-    val = server.oom_score_adj_base + server.oom_score_adj_values[process_class];
+    val = server.oom_score_adj_values[process_class];
+    if (server.oom_score_adj == OOM_SCORE_RELATIVE)
+        val += server.oom_score_adj_base;
     if (val > 1000) val = 1000;
     if (val < -1000) val = -1000;
 
@@ -2868,6 +2926,7 @@ void resetServerStats(void) {
     server.stat_active_defrag_scanned = 0;
     server.stat_fork_time = 0;
     server.stat_fork_rate = 0;
+    server.stat_total_forks = 0;
     server.stat_rejected_conn = 0;
     server.stat_sync_full = 0;
     server.stat_sync_partial_ok = 0;
@@ -2886,6 +2945,7 @@ void resetServerStats(void) {
     atomicSet(server.stat_net_input_bytes, 0);
     atomicSet(server.stat_net_output_bytes, 0);
     server.stat_unexpected_error_replies = 0;
+    server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
     server.blocked_last_cron = 0;
 }
@@ -2984,7 +3044,7 @@ void initServer(void) {
     /* Create the Redis databases, and initialize other internal state. */
     for (j = 0; j < server.dbnum; j++) {
         server.db[j].dict = dictCreate(&dbDictType,NULL);
-        server.db[j].expires = dictCreate(&keyptrDictType,NULL);
+        server.db[j].expires = dictCreate(&dbExpiresDictType,NULL);
         server.db[j].expires_cursor = 0;
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
@@ -3001,6 +3061,9 @@ void initServer(void) {
     listSetFreeMethod(server.pubsub_patterns,freePubsubPattern);
     listSetMatchMethod(server.pubsub_patterns,listMatchPubsubPattern);
     server.cronloops = 0;
+    server.in_eval = 0;
+    server.in_exec = 0;
+    server.propagate_in_transaction = 0;
     server.rdb_child_pid = -1;
     server.aof_child_pid = -1;
     server.module_child_pid = -1;
@@ -3467,8 +3530,13 @@ void call(client *c, int flags) {
         char *latency_event = (c->cmd->flags & CMD_FAST) ?
                               "fast-command" : "command";
         latencyAddSampleIfNeeded(latency_event,duration/1000);
-        slowlogPushEntryIfNeeded(c,c->argv,c->argc,duration);
+        /* If command argument vector was rewritten, use the original
+         * arguments. */
+        robj **argv = c->original_argv ? c->original_argv : c->argv;
+        int argc = c->original_argv ? c->original_argc : c->argc;
+        slowlogPushEntryIfNeeded(c,argv,argc,duration);
     }
+    freeClientOriginalArgv(c);
 
     if (flags & CMD_CALL_STATS) {
         /* use the real command that was executed (cmd and lastamc) may be
@@ -4211,7 +4279,6 @@ sds genRedisInfoString(const char *section) {
     sds info = sdsempty();
     time_t uptime = server.unixtime-server.stat_starttime;
     int j;
-    struct rusage self_ru, c_ru;
     int allsections = 0, defsections = 0, everything = 0, modules = 0;
     int sections = 0;
 
@@ -4222,18 +4289,24 @@ sds genRedisInfoString(const char *section) {
     modules = strcasecmp(section,"modules") == 0;
     if (everything) allsections = 1;
 
-    getrusage(RUSAGE_SELF, &self_ru);
-    getrusage(RUSAGE_CHILDREN, &c_ru);
-
     /* Server */
     if (allsections || defsections || !strcasecmp(section,"server")) {
         static int call_uname = 1;
         static struct utsname name;
         char *mode;
+        char *supervised;
 
         if (server.cluster_enabled) mode = "cluster";
         else if (server.sentinel_mode) mode = "sentinel";
         else mode = "standalone";
+
+        if (server.supervised) {
+            if (server.supervised_mode == SUPERVISED_UPSTART) supervised = "upstart";
+            else if (server.supervised_mode == SUPERVISED_SYSTEMD) supervised = "systemd";
+            else supervised = "unknown";
+        } else {
+            supervised = "no";
+        }
 
         if (sections++) info = sdscat(info,"\r\n");
 
@@ -4258,8 +4331,10 @@ sds genRedisInfoString(const char *section) {
             "atomicvar_api:%s\r\n"
             "gcc_version:%i.%i.%i\r\n"
             "process_id:%I\r\n"
+            "process_supervised:%s\r\n"
             "run_id:%s\r\n"
             "tcp_port:%i\r\n"
+            "server_time_usec:%I\r\n"
             "uptime_in_seconds:%I\r\n"
             "uptime_in_days:%I\r\n"
             "hz:%i\r\n"
@@ -4283,8 +4358,10 @@ sds genRedisInfoString(const char *section) {
             0,0,0,
 #endif
             (int64_t) getpid(),
+            supervised,
             server.runid,
             server.port ? server.port : server.tls_port,
+            (int64_t)server.ustime,
             (int64_t)uptime,
             (int64_t)(uptime/(3600*24)),
             server.hz,
@@ -4391,7 +4468,8 @@ sds genRedisInfoString(const char *section) {
             "mem_aof_buffer:%zu\r\n"
             "mem_allocator:%s\r\n"
             "active_defrag_running:%d\r\n"
-            "lazyfree_pending_objects:%zu\r\n",
+            "lazyfree_pending_objects:%zu\r\n"
+            "lazyfreed_objects:%zu\r\n",
             zmalloc_used,
             hmem,
             server.cron_malloc_stats.process_rss,
@@ -4434,7 +4512,8 @@ sds genRedisInfoString(const char *section) {
             mh->aof_buffer,
             ZMALLOC_LIB,
             server.active_defrag_running,
-            lazyfreeGetPendingObjectsCount()
+            lazyfreeGetPendingObjectsCount(),
+            lazyfreeGetFreedObjectsCount()
         );
         freeMemoryOverheadData(mh);
     }
@@ -4575,6 +4654,7 @@ sds genRedisInfoString(const char *section) {
             "pubsub_channels:%ld\r\n"
             "pubsub_patterns:%lu\r\n"
             "latest_fork_usec:%lld\r\n"
+            "total_forks:%lld\r\n"
             "migrate_cached_sockets:%ld\r\n"
             "slave_expires_tracked_keys:%zu\r\n"
             "active_defrag_hits:%lld\r\n"
@@ -4585,6 +4665,7 @@ sds genRedisInfoString(const char *section) {
             "tracking_total_items:%lld\r\n"
             "tracking_total_prefixes:%lld\r\n"
             "unexpected_error_replies:%lld\r\n"
+            "dump_payload_sanitizations:%lld\r\n"
             "total_reads_processed:%lld\r\n"
             "total_writes_processed:%lld\r\n"
             "io_threaded_reads_processed:%lld\r\n"
@@ -4610,6 +4691,7 @@ sds genRedisInfoString(const char *section) {
             dictSize(server.pubsub_channels),
             listLength(server.pubsub_patterns),
             server.stat_fork_time,
+            server.stat_total_forks,
             dictSize(server.migrate_cached_sockets),
             getSlaveKeyWithExpireCount(),
             server.stat_active_defrag_hits,
@@ -4620,6 +4702,7 @@ sds genRedisInfoString(const char *section) {
             (unsigned long long) trackingGetTotalItems(),
             (unsigned long long) trackingGetTotalPrefixes(),
             server.stat_unexpected_error_replies,
+            server.stat_dump_payload_sanitizations,
             stat_total_reads_processed,
             stat_total_writes_processed,
             server.stat_io_reads_processed,
@@ -4766,6 +4849,10 @@ sds genRedisInfoString(const char *section) {
     /* CPU */
     if (allsections || defsections || !strcasecmp(section,"cpu")) {
         if (sections++) info = sdscat(info,"\r\n");
+
+        struct rusage self_ru, c_ru;
+        getrusage(RUSAGE_SELF, &self_ru);
+        getrusage(RUSAGE_CHILDREN, &c_ru);
         info = sdscatprintf(info,
         "# CPU\r\n"
         "used_cpu_sys:%ld.%06ld\r\n"
@@ -4776,6 +4863,15 @@ sds genRedisInfoString(const char *section) {
         (long)self_ru.ru_utime.tv_sec, (long)self_ru.ru_utime.tv_usec,
         (long)c_ru.ru_stime.tv_sec, (long)c_ru.ru_stime.tv_usec,
         (long)c_ru.ru_utime.tv_sec, (long)c_ru.ru_utime.tv_usec);
+#ifdef RUSAGE_THREAD
+        struct rusage m_ru;
+        getrusage(RUSAGE_THREAD, &m_ru);
+        info = sdscatprintf(info,
+            "used_cpu_sys_main_thread:%ld.%06ld\r\n"
+            "used_cpu_user_main_thread:%ld.%06ld\r\n",
+            (long)m_ru.ru_stime.tv_sec, (long)m_ru.ru_stime.tv_usec,
+            (long)m_ru.ru_utime.tv_sec, (long)m_ru.ru_utime.tv_usec);
+#endif  /* RUSAGE_THREAD */
     }
 
     /* Modules */
@@ -4857,6 +4953,14 @@ void infoCommand(client *c) {
 }
 
 void monitorCommand(client *c) {
+    if (c->flags & CLIENT_DENY_BLOCKING) {
+        /**
+         * A client that has CLIENT_DENY_BLOCKING flag on
+         * expects a reply per command and so can't execute MONITOR. */
+        addReplyError(c, "MONITOR isn't allowed for DENY BLOCKING client");
+        return;
+    }
+
     /* ignore MONITOR if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
 
@@ -5099,6 +5203,7 @@ int redisFork(int purpose) {
         closeClildUnusedResourceAfterFork();
     } else {
         /* Parent */
+        server.stat_total_forks++;
         server.stat_fork_time = ustime()-start;
         server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
         latencyAddSampleIfNeeded("fork",server.stat_fork_time/1000);
@@ -5205,62 +5310,82 @@ void redisSetCpuAffinity(const char *cpulist) {
 #endif
 }
 
-/*
- * Check whether systemd or upstart have been used to start redis.
- */
+/* Send a notify message to systemd. Returns sd_notify return code which is
+ * a positive number on success. */
+int redisCommunicateSystemd(const char *sd_notify_msg) {
+#ifdef HAVE_LIBSYSTEMD
+    int ret = sd_notify(0, sd_notify_msg);
 
-int redisSupervisedUpstart(void) {
+    if (ret == 0)
+        serverLog(LL_WARNING, "systemd supervision error: NOTIFY_SOCKET not found!");
+    else if (ret < 0)
+        serverLog(LL_WARNING, "systemd supervision error: sd_notify: %d", ret);
+    return ret;
+#else
+    UNUSED(sd_notify_msg);
+    return 0;
+#endif
+}
+
+/* Attempt to set up upstart supervision. Returns 1 if successful. */
+static int redisSupervisedUpstart(void) {
     const char *upstart_job = getenv("UPSTART_JOB");
 
     if (!upstart_job) {
         serverLog(LL_WARNING,
-                "upstart supervision requested, but UPSTART_JOB not found");
+                "upstart supervision requested, but UPSTART_JOB not found!");
         return 0;
     }
 
-    serverLog(LL_NOTICE, "supervised by upstart, will stop to signal readiness");
+    serverLog(LL_NOTICE, "supervised by upstart, will stop to signal readiness.");
     raise(SIGSTOP);
     unsetenv("UPSTART_JOB");
     return 1;
 }
 
-int redisCommunicateSystemd(const char *sd_notify_msg) {
-    const char *notify_socket = getenv("NOTIFY_SOCKET");
-    if (!notify_socket) {
-        serverLog(LL_WARNING,
-                "systemd supervision requested, but NOTIFY_SOCKET not found");
-    }
-
-    #ifdef HAVE_LIBSYSTEMD
-    (void) sd_notify(0, sd_notify_msg);
-    #else
-    UNUSED(sd_notify_msg);
-    #endif
+/* Attempt to set up systemd supervision. Returns 1 if successful. */
+static int redisSupervisedSystemd(void) {
+#ifndef HAVE_LIBSYSTEMD
+    serverLog(LL_WARNING,
+            "systemd supervision requested or auto-detected, but Redis is compiled without libsystemd support!");
     return 0;
+#else
+    if (redisCommunicateSystemd("STATUS=Redis is loading...\n") <= 0)
+        return 0;
+    serverLog(LL_NOTICE,
+        "Supervised by systemd. Please make sure you set appropriate values for TimeoutStartSec and TimeoutStopSec in your service unit.");
+    return 1;
+#endif
 }
 
 int redisIsSupervised(int mode) {
-    if (mode == SUPERVISED_AUTODETECT) {
-        const char *upstart_job = getenv("UPSTART_JOB");
-        const char *notify_socket = getenv("NOTIFY_SOCKET");
+    int ret = 0;
 
-        if (upstart_job) {
-            redisSupervisedUpstart();
-        } else if (notify_socket) {
-            server.supervised_mode = SUPERVISED_SYSTEMD;
-            serverLog(LL_WARNING,
-                "WARNING auto-supervised by systemd - you MUST set appropriate values for TimeoutStartSec and TimeoutStopSec in your service unit.");
-            return redisCommunicateSystemd("STATUS=Redis is loading...\n");
+    if (mode == SUPERVISED_AUTODETECT) {
+        if (getenv("UPSTART_JOB")) {
+            serverLog(LL_VERBOSE, "Upstart supervision detected.");
+            mode = SUPERVISED_UPSTART;
+        } else if (getenv("NOTIFY_SOCKET")) {
+            serverLog(LL_VERBOSE, "Systemd supervision detected.");
+            mode = SUPERVISED_SYSTEMD;
         }
-    } else if (mode == SUPERVISED_UPSTART) {
-        return redisSupervisedUpstart();
-    } else if (mode == SUPERVISED_SYSTEMD) {
-        serverLog(LL_WARNING,
-            "WARNING supervised by systemd - you MUST set appropriate values for TimeoutStartSec and TimeoutStopSec in your service unit.");
-        return redisCommunicateSystemd("STATUS=Redis is loading...\n");
     }
 
-    return 0;
+    switch (mode) {
+        case SUPERVISED_UPSTART:
+            ret = redisSupervisedUpstart();
+            break;
+        case SUPERVISED_SYSTEMD:
+            ret = redisSupervisedSystemd();
+            break;
+        default:
+            break;
+    }
+
+    if (ret)
+        server.supervised_mode = mode;
+
+    return ret;
 }
 
 int iAmMaster(void) {

@@ -669,9 +669,22 @@ struct client *createAOFClient(void) {
     c->querybuf_peak = 0;
     c->argc = 0;
     c->argv = NULL;
+    c->original_argc = 0;
+    c->original_argv = NULL;
     c->argv_len_sum = 0;
     c->bufpos = 0;
-    c->flags = 0;
+
+    /*
+     * The AOF client should never be blocked (unlike master
+     * replication connection).
+     * This is because blocking the AOF client might cause
+     * deadlock (because potentially no one will unblock it).
+     * Also, if the AOF client will be blocked just for
+     * background processing there is a chance that the
+     * command execution order will be violated.
+     */
+    c->flags = CLIENT_DENY_BLOCKING;
+
     c->btype = BLOCKED_NONE;
     /* We set the fake client as a slave waiting for the synchronization
      * so that Redis will not try to send replies to this client. */
@@ -704,6 +717,7 @@ void freeFakeClient(struct client *c) {
     listRelease(c->reply);
     listRelease(c->watched_keys);
     freeClientMultiState(c);
+    freeClientOriginalArgv(c);
     zfree(c);
 }
 
@@ -1341,6 +1355,9 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
                     if (rioWriteStreamEmptyConsumer(r,key,(char*)ri.key,
                                                     ri.key_len,consumer) == 0)
                     {
+                        raxStop(&ri_cons);
+                        raxStop(&ri);
+                        streamIteratorStop(&si);
                         return 0;
                     }
                     continue;
@@ -1711,7 +1728,7 @@ int rewriteAppendOnlyFileBackground(void) {
             return C_ERR;
         }
         serverLog(LL_NOTICE,
-            "Background append only file rewriting started by pid %d",childpid);
+            "Background append only file rewriting started by pid %ld",(long) childpid);
         server.aof_rewrite_scheduled = 0;
         server.aof_rewrite_time_start = time(NULL);
         server.aof_child_pid = childpid;

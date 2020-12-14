@@ -104,6 +104,28 @@ configEnum tls_auth_clients_enum[] = {
     {"optional", TLS_CLIENT_AUTH_OPTIONAL},
     {NULL, 0}
 };
+
+configEnum oom_score_adj_enum[] = {
+    {"no", OOM_SCORE_ADJ_NO},
+    {"yes", OOM_SCORE_RELATIVE},
+    {"relative", OOM_SCORE_RELATIVE},
+    {"absolute", OOM_SCORE_ADJ_ABSOLUTE},
+    {NULL, 0}
+};
+
+configEnum acl_pubsub_default_enum[] = {
+    {"allchannels", USER_FLAG_ALLCHANNELS},
+    {"resetchannels", 0},
+    {NULL, 0}
+};
+
+configEnum sanitize_dump_payload_enum[] = {
+    {"no", SANITIZE_DUMP_NO},
+    {"yes", SANITIZE_DUMP_YES},
+    {"clients", SANITIZE_DUMP_CLIENTS},
+    {NULL, 0}
+};
+
 /* Output buffer limits presets. */
 clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
     {0, 0, 0}, /* normal */
@@ -293,7 +315,7 @@ void queueLoadModule(sds path, sds *argv, int argc) {
  * server.oom_score_adj_values if valid.
  */
 
-static int updateOOMScoreAdjValues(sds *args, char **err) {
+static int updateOOMScoreAdjValues(sds *args, char **err, int apply) {
     int i;
     int values[CONFIG_OOM_COUNT];
 
@@ -301,8 +323,8 @@ static int updateOOMScoreAdjValues(sds *args, char **err) {
         char *eptr;
         long long val = strtoll(args[i], &eptr, 10);
 
-        if (*eptr != '\0' || val < -1000 || val > 1000) {
-            if (err) *err = "Invalid oom-score-adj-values, elements must be between -1000 and 1000.";
+        if (*eptr != '\0' || val < -2000 || val > 2000) {
+            if (err) *err = "Invalid oom-score-adj-values, elements must be between -2000 and 2000.";
             return C_ERR;
         }
 
@@ -326,6 +348,10 @@ static int updateOOMScoreAdjValues(sds *args, char **err) {
         old_values[i] = server.oom_score_adj_values[i];
         server.oom_score_adj_values[i] = values[i];
     }
+    
+    /* When parsing the config file, we want to apply only when all is done. */
+    if (!apply)
+        return C_OK;
 
     /* Update */
     if (setOOMScoreAdj(-1) == C_ERR) {
@@ -559,7 +585,7 @@ void loadServerConfigFromString(char *config) {
             server.client_obuf_limits[class].soft_limit_bytes = soft;
             server.client_obuf_limits[class].soft_limit_seconds = soft_seconds;
         } else if (!strcasecmp(argv[0],"oom-score-adj-values") && argc == 1 + CONFIG_OOM_COUNT) {
-            if (updateOOMScoreAdjValues(&argv[1], &err) == C_ERR) goto loaderr;
+            if (updateOOMScoreAdjValues(&argv[1], &err, 0) == C_ERR) goto loaderr;
         } else if (!strcasecmp(argv[0],"notify-keyspace-events") && argc == 2) {
             int flags = keyspaceEventsStringToFlags(argv[1]);
 
@@ -822,7 +848,7 @@ void configSetCommand(client *c) {
         int success = 1;
 
         sds *v = sdssplitlen(o->ptr, sdslen(o->ptr), " ", 1, &vlen);
-        if (vlen != CONFIG_OOM_COUNT || updateOOMScoreAdjValues(v, &errstr) == C_ERR)
+        if (vlen != CONFIG_OOM_COUNT || updateOOMScoreAdjValues(v, &errstr, 1) == C_ERR)
             success = 0;
 
         sdsfreesplitres(v, vlen);
@@ -976,7 +1002,7 @@ void configGetCommand(client *c) {
     }
     if (stringmatch(pattern,"unixsocketperm",1)) {
         char buf[32];
-        snprintf(buf,sizeof(buf),"%o",server.unixsocketperm);
+        snprintf(buf,sizeof(buf),"%lo",(unsigned long) server.unixsocketperm);
         addReplyBulkCString(c,"unixsocketperm");
         addReplyBulkCString(c,buf);
         matches++;
@@ -1066,7 +1092,8 @@ dictType optionToLineDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    dictListDestructor          /* val destructor */
+    dictListDestructor,         /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 dictType optionSetDictType = {
@@ -1075,7 +1102,8 @@ dictType optionSetDictType = {
     NULL,                       /* val dup */
     dictSdsKeyCaseCompare,      /* key compare */
     dictSdsDestructor,          /* key destructor */
-    NULL                        /* val destructor */
+    NULL,                       /* val destructor */
+    NULL                        /* allow to expand */
 };
 
 /* The config rewrite state. */
@@ -2313,7 +2341,6 @@ standardConfig configs[] = {
     createBoolConfig("crash-log-enabled", NULL, MODIFIABLE_CONFIG, server.crashlog_enabled, 1, NULL, updateSighandlerEnabled),
     createBoolConfig("crash-memcheck-enabled", NULL, MODIFIABLE_CONFIG, server.memcheck_enabled, 1, NULL, NULL),
     createBoolConfig("use-exit-on-panic", NULL, MODIFIABLE_CONFIG, server.use_exit_on_panic, 0, NULL, NULL),
-    createBoolConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, server.oom_score_adj, 0, NULL, updateOOMScoreAdj),
     createBoolConfig("disable-thp", NULL, MODIFIABLE_CONFIG, server.disable_thp, 1, NULL, NULL),
 
     /* String Configs */
@@ -2339,6 +2366,9 @@ standardConfig configs[] = {
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, NULL),
+    createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
+    createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubusub_default, USER_FLAG_ALLCHANNELS, NULL, NULL),
+    createEnumConfig("sanitize-dump-payload", NULL, MODIFIABLE_CONFIG, sanitize_dump_payload_enum, server.sanitize_dump_payload, SANITIZE_DUMP_NO, NULL, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
@@ -2420,6 +2450,8 @@ standardConfig configs[] = {
     createBoolConfig("tls-session-caching", NULL, MODIFIABLE_CONFIG, server.tls_ctx_config.session_caching, 1, NULL, updateTlsCfgBool),
     createStringConfig("tls-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.cert_file, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.key_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-client-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_cert_file, NULL, NULL, updateTlsCfg),
+    createStringConfig("tls-client-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.client_key_file, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-dh-params-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.dh_params_file, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-ca-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_file, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-ca-cert-dir", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ca_cert_dir, NULL, NULL, updateTlsCfg),

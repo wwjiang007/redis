@@ -1299,7 +1299,8 @@ static int fetchClusterSlotsConfiguration(client c) {
         NULL,                      /* val dup */
         dictSdsKeyCompare,         /* key compare */
         NULL,                      /* key destructor */
-        NULL                       /* val destructor */
+        NULL,                      /* val destructor */
+        NULL                       /* allow to expand */
     };
     /* printf("[%d] fetchClusterSlotsConfiguration\n", c->thread_id); */
     dict *masters = dictCreate(&dtype, NULL);
@@ -1675,7 +1676,7 @@ int main(int argc, const char **argv) {
 
     client c;
 
-    srandom(time(NULL));
+    srandom(time(NULL) ^ getpid());
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
 
@@ -1829,7 +1830,7 @@ int main(int argc, const char **argv) {
 
         if (test_is_selected("ping_mbulk") || test_is_selected("ping")) {
             len = redisFormatCommand(&cmd,"PING");
-            benchmark("PING_BULK",cmd,len);
+            benchmark("PING_MBULK",cmd,len);
             free(cmd);
         }
 

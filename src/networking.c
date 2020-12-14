@@ -139,6 +139,8 @@ client *createClient(connection *conn) {
     c->argc = 0;
     c->argv = NULL;
     c->argv_len_sum = 0;
+    c->original_argc = 0;
+    c->original_argv = NULL;
     c->cmd = c->lastcmd = NULL;
     c->multibulklen = 0;
     c->bulklen = -1;
@@ -268,6 +270,9 @@ int prepareClientToWrite(client *c) {
  * Low level functions to add more data to output buffers.
  * -------------------------------------------------------------------------- */
 
+/* Attempts to add the reply to the static buffer in the client struct.
+ * Returns C_ERR if the buffer is full, or the reply list is not empty,
+ * in which case the reply must be added to the reply list. */
 int _addReplyToBuffer(client *c, const char *s, size_t len) {
     size_t available = sizeof(c->buf)-c->bufpos;
 
@@ -285,6 +290,8 @@ int _addReplyToBuffer(client *c, const char *s, size_t len) {
     return C_OK;
 }
 
+/* Adds the reply to the reply linked list.
+ * Note: some edits to this function need to be relayed to AddReplyFromClient. */
 void _addReplyProtoToList(client *c, const char *s, size_t len) {
     if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return;
 
@@ -672,6 +679,7 @@ void addReplyLongLong(client *c, long long ll) {
 }
 
 void addReplyAggregateLen(client *c, long length, int prefix) {
+    serverAssert(length >= 0);
     if (prefix == '*' && length < OBJ_SHARED_BULKHDR_LEN)
         addReply(c,shared.mbulkhdr[length]);
     else
@@ -845,14 +853,40 @@ void addReplySubcommandSyntaxError(client *c) {
 /* Append 'src' client output buffers into 'dst' client output buffers. 
  * This function clears the output buffers of 'src' */
 void AddReplyFromClient(client *dst, client *src) {
+    /* If the source client contains a partial response due to client output
+     * buffer limits, propagate that to the dest rather than copy a partial
+     * reply. We don't wanna run the risk of copying partial response in case
+     * for some reason the output limits don't reach the same decision (maybe
+     * they changed) */
+    if (src->flags & CLIENT_CLOSE_ASAP) {
+        sds client = catClientInfoString(sdsempty(),dst);
+        freeClientAsync(dst);
+        serverLog(LL_WARNING,"Client %s scheduled to be closed ASAP for overcoming of output buffer limits.", client);
+        sdsfree(client);
+        return;
+    }
+
+    /* First add the static buffer (either into the static buffer or reply list) */
+    addReplyProto(dst,src->buf, src->bufpos);
+
+    /* We need to check with prepareClientToWrite again (after addReplyProto)
+     * since addReplyProto may have changed something (like CLIENT_CLOSE_ASAP) */
     if (prepareClientToWrite(dst) != C_OK)
         return;
-    addReplyProto(dst,src->buf, src->bufpos);
+
+    /* We're bypassing _addReplyProtoToList, so we need to add the pre/post
+     * checks in it. */
+    if (dst->flags & CLIENT_CLOSE_AFTER_REPLY) return;
+
+    /* Concatenate the reply list into the dest */
     if (listLength(src->reply))
         listJoin(dst->reply,src->reply);
     dst->reply_bytes += src->reply_bytes;
     src->reply_bytes = 0;
     src->bufpos = 0;
+
+    /* Check output buffer limits */
+    asyncCloseClientOnOutputBufferLimitReached(dst);
 }
 
 /* Copy 'src' client output buffers into 'dst' client output buffers.
@@ -1065,6 +1099,17 @@ void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
+void freeClientOriginalArgv(client *c) {
+    /* We didn't rewrite this client */
+    if (!c->original_argv) return;
+
+    for (int j = 0; j < c->original_argc; j++)
+        decrRefCount(c->original_argv[j]);
+    zfree(c->original_argv);
+    c->original_argv = NULL;
+    c->original_argc = 0;
+}
+
 static void freeClientArgv(client *c) {
     int j;
     for (j = 0; j < c->argc; j++)
@@ -1246,6 +1291,7 @@ void freeClient(client *c) {
     /* Free data structures. */
     listRelease(c->reply);
     freeClientArgv(c);
+    freeClientOriginalArgv(c);
 
     /* Unlink the client: this will close the socket, remove the I/O
      * handlers, and remove references of the client from different
@@ -2155,6 +2201,7 @@ sds catClientInfoString(sds s, client *client) {
     if (client->flags & CLIENT_BLOCKED) *p++ = 'b';
     if (client->flags & CLIENT_TRACKING) *p++ = 't';
     if (client->flags & CLIENT_TRACKING_BROKEN_REDIR) *p++ = 'R';
+    if (client->flags & CLIENT_TRACKING_BCAST) *p++ = 'B';
     if (client->flags & CLIENT_DIRTY_CAS) *p++ = 'd';
     if (client->flags & CLIENT_CLOSE_AFTER_REPLY) *p++ = 'c';
     if (client->flags & CLIENT_UNBLOCKED) *p++ = 'u';
@@ -2184,7 +2231,7 @@ sds catClientInfoString(sds s, client *client) {
         total_mem += zmalloc_size(client->argv);
 
     return sdscatfmt(s,
-        "id=%U addr=%s laddr=%s %s name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U argv-mem=%U obl=%U oll=%U omem=%U tot-mem=%U events=%s cmd=%s user=%s",
+        "id=%U addr=%s laddr=%s %s name=%s age=%I idle=%I flags=%s db=%i sub=%i psub=%i multi=%i qbuf=%U qbuf-free=%U argv-mem=%U obl=%U oll=%U omem=%U tot-mem=%U events=%s cmd=%s user=%s redir=%I",
         (unsigned long long) client->id,
         getClientPeerId(client),
         getClientSockname(client),
@@ -2206,7 +2253,8 @@ sds catClientInfoString(sds s, client *client) {
         (unsigned long long) total_mem,
         events,
         client->lastcmd ? client->lastcmd->name : "NULL",
-        client->user ? client->user->name : "(superuser)");
+        client->user ? client->user->name : "(superuser)",
+        (client->flags & CLIENT_TRACKING) ? (long long) client->client_tracking_redirection : -1);
 }
 
 sds getAllClientsInfoString(int type) {
@@ -2314,6 +2362,7 @@ void clientCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
 "ID                     -- Return the ID of the current connection.",
+"INFO                   -- Return information about the current client connection.",
 "GETNAME                -- Return the name of the current connection.",
 "KILL <ip:port>         -- Kill connection made from <ip:port>.",
 "KILL <option> <value> [option value ...] -- Kill connections. Options are:",
@@ -2324,6 +2373,7 @@ void clientCommand(client *c) {
 "     SKIPME (yes|no)   -- Skip killing current connection (default: yes).",
 "LIST [options ...]     -- Return information about client connections. Options:",
 "     TYPE (normal|master|replica|pubsub) -- Return clients of specified type.",
+"     ID id [id ...]                      -- Return clients of specified IDs only.",
 "PAUSE <timeout>        -- Suspend all Redis clients for <timout> milliseconds.",
 "REPLY (on|off|skip)    -- Control the replies sent to the current connection.",
 "SETNAME <name>         -- Assign the name <name> to the current connection.",
@@ -2337,21 +2387,46 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"id") && c->argc == 2) {
         /* CLIENT ID */
         addReplyLongLong(c,c->id);
+    } else if (!strcasecmp(c->argv[1]->ptr,"info") && c->argc == 2) {
+        /* CLIENT INFO */
+        sds o = catClientInfoString(sdsempty(), c);
+        o = sdscatlen(o,"\n",1);
+        addReplyVerbatim(c,o,sdslen(o),"txt");
+        sdsfree(o);
     } else if (!strcasecmp(c->argv[1]->ptr,"list")) {
         /* CLIENT LIST */
         int type = -1;
+        sds o = NULL;
         if (c->argc == 4 && !strcasecmp(c->argv[2]->ptr,"type")) {
             type = getClientTypeByName(c->argv[3]->ptr);
             if (type == -1) {
                 addReplyErrorFormat(c,"Unknown client type '%s'",
                     (char*) c->argv[3]->ptr);
                 return;
-             }
+            }
+        } else if (c->argc > 3 && !strcasecmp(c->argv[2]->ptr,"id")) {
+            int j;
+            o = sdsempty();
+            for (j = 3; j < c->argc; j++) {
+                long long cid;
+                if (getLongLongFromObjectOrReply(c, c->argv[j], &cid,
+                            "Invalid client ID")) {
+                    sdsfree(o);
+                    return;
+                }
+                client *cl = lookupClientByID(cid);
+                if (cl) {
+                    o = catClientInfoString(o, cl);
+                    o = sdscatlen(o, "\n", 1);
+                }
+            }
         } else if (c->argc != 2) {
             addReply(c,shared.syntaxerr);
             return;
         }
-        sds o = getAllClientsInfoString(type);
+
+        if (!o)
+            o = getAllClientsInfoString(type);
         addReplyVerbatim(c,o,sdslen(o),"txt");
         sdsfree(o);
     } else if (!strcasecmp(c->argv[1]->ptr,"reply") && c->argc == 3) {
@@ -2765,6 +2840,19 @@ void securityWarningCommand(client *c) {
     freeClientAsync(c);
 }
 
+/* Keep track of the original command arguments so that we can generate
+ * an accurate slowlog entry after the command has been executed. */
+static void retainOriginalCommandVector(client *c) {
+    /* We already rewrote this command, so don't rewrite it again */
+    if (c->original_argv) return;
+    c->original_argc = c->argc;
+    c->original_argv = zmalloc(sizeof(robj*)*(c->argc));
+    for (int j = 0; j < c->argc; j++) {
+        c->original_argv[j] = c->argv[j];
+        incrRefCount(c->argv[j]);
+    }
+}
+
 /* Rewrite the command vector of the client. All the new objects ref count
  * is incremented. The old command vector is freed, and the old objects
  * ref count is decremented. */
@@ -2782,26 +2870,14 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
         argv[j] = a;
         incrRefCount(a);
     }
-    /* We free the objects in the original vector at the end, so we are
-     * sure that if the same objects are reused in the new vector the
-     * refcount gets incremented before it gets decremented. */
-    for (j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-    zfree(c->argv);
-    /* Replace argv and argc with our new versions. */
-    c->argv = argv;
-    c->argc = argc;
-    c->argv_len_sum = 0;
-    for (j = 0; j < c->argc; j++)
-        if (c->argv[j])
-            c->argv_len_sum += getStringObjectLen(c->argv[j]);
-    c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
-    serverAssertWithInfo(c,NULL,c->cmd != NULL);
+    replaceClientCommandVector(c, argc, argv);
     va_end(ap);
 }
 
 /* Completely replace the client command vector with the provided one. */
 void replaceClientCommandVector(client *c, int argc, robj **argv) {
     int j;
+    retainOriginalCommandVector(c);
     freeClientArgv(c);
     zfree(c->argv);
     c->argv = argv;
@@ -2827,7 +2903,7 @@ void replaceClientCommandVector(client *c, int argc, robj **argv) {
  *    free the no longer used objects on c->argv. */
 void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     robj *oldval;
-
+    retainOriginalCommandVector(c);
     if (i >= c->argc) {
         c->argv = zrealloc(c->argv,sizeof(robj*)*(i+1));
         c->argc = i+1;
