@@ -111,6 +111,7 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
     unsigned char *fp; /* flags pointer. */
     size_t usable;
 
+    assert(initlen + hdrlen + 1 > initlen); /* Catch size_t overflow */
     sh = trymalloc?
         s_trymalloc_usable(hdrlen+initlen+1, &usable) :
         s_malloc_usable(hdrlen+initlen+1, &usable);
@@ -243,6 +244,7 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     len = sdslen(s);
     sh = (char*)s-sdsHdrSize(oldtype);
     newlen = (len+addlen);
+    assert(newlen > len);   /* Catch size_t overflow */
     if (newlen < SDS_MAX_PREALLOC)
         newlen *= 2;
     else
@@ -256,6 +258,7 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     if (type == SDS_TYPE_5) type = SDS_TYPE_8;
 
     hdrlen = sdsHdrSize(type);
+    assert(hdrlen + newlen + 1 > len);  /* Catch size_t overflow */
     if (oldtype==type) {
         newsh = s_realloc_usable(sh, hdrlen+newlen+1, &usable);
         if (newsh == NULL) return NULL;
@@ -642,7 +645,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
     /* To avoid continuous reallocations, let's start with a buffer that
      * can hold at least two times the format string itself. It's not the
      * best heuristic but seems to work in practice. */
-    s = sdsMakeRoomFor(s, initlen + strlen(fmt)*2);
+    s = sdsMakeRoomFor(s, strlen(fmt)*2);
     va_start(ap,fmt);
     f = fmt;    /* Next format specifier byte to process. */
     i = initlen; /* Position of the next byte to write to dest str. */
@@ -1157,26 +1160,95 @@ void *sds_malloc(size_t size) { return s_malloc(size); }
 void *sds_realloc(void *ptr, size_t size) { return s_realloc(ptr,size); }
 void sds_free(void *ptr) { s_free(ptr); }
 
+/* Perform expansion of a template string and return the result as a newly
+ * allocated sds.
+ *
+ * Template variables are specified using curly brackets, e.g. {variable}.
+ * An opening bracket can be quoted by repeating it twice.
+ */
+sds sdstemplate(const char *template, sdstemplate_callback_t cb_func, void *cb_arg)
+{
+    sds res = sdsempty();
+    const char *p = template;
+
+    while (*p) {
+        /* Find next variable, copy everything until there */
+        const char *sv = strchr(p, '{');
+        if (!sv) {
+            /* Not found: copy till rest of template and stop */
+            res = sdscat(res, p);
+            break;
+        } else if (sv > p) {
+            /* Found: copy anything up to the begining of the variable */
+            res = sdscatlen(res, p, sv - p);
+        }
+
+        /* Skip into variable name, handle premature end or quoting */
+        sv++;
+        if (!*sv) goto error;       /* Premature end of template */
+        if (*sv == '{') {
+            /* Quoted '{' */
+            p = sv + 1;
+            res = sdscat(res, "{");
+            continue;
+        }
+
+        /* Find end of variable name, handle premature end of template */
+        const char *ev = strchr(sv, '}');
+        if (!ev) goto error;
+
+        /* Pass variable name to callback and obtain value. If callback failed,
+         * abort. */
+        sds varname = sdsnewlen(sv, ev - sv);
+        sds value = cb_func(varname, cb_arg);
+        sdsfree(varname);
+        if (!value) goto error;
+
+        /* Append value to result and continue */
+        res = sdscat(res, value);
+        sdsfree(value);
+        p = ev + 1;
+    }
+
+    return res;
+
+error:
+    sdsfree(res);
+    return NULL;
+}
+
 #ifdef REDIS_TEST
 #include <stdio.h>
+#include <limits.h>
 #include "testhelp.h"
-#include "limits.h"
 
 #define UNUSED(x) (void)(x)
-int sdsTest(int argc, char **argv) {
+
+static sds sdsTestTemplateCallback(sds varname, void *arg) {
+    UNUSED(arg);
+    static const char *_var1 = "variable1";
+    static const char *_var2 = "variable2";
+
+    if (!strcmp(varname, _var1)) return sdsnew("value1");
+    else if (!strcmp(varname, _var2)) return sdsnew("value2");
+    else return NULL;
+}
+
+int sdsTest(int argc, char **argv, int accurate) {
     UNUSED(argc);
     UNUSED(argv);
+    UNUSED(accurate);
 
     {
         sds x = sdsnew("foo"), y;
 
         test_cond("Create a string and obtain the length",
-            sdslen(x) == 3 && memcmp(x,"foo\0",4) == 0)
+            sdslen(x) == 3 && memcmp(x,"foo\0",4) == 0);
 
         sdsfree(x);
         x = sdsnewlen("foo",2);
         test_cond("Create a string with specified length",
-            sdslen(x) == 2 && memcmp(x,"fo\0",3) == 0)
+            sdslen(x) == 2 && memcmp(x,"fo\0",3) == 0);
 
         x = sdscat(x,"bar");
         test_cond("Strings concatenation",
@@ -1184,22 +1256,22 @@ int sdsTest(int argc, char **argv) {
 
         x = sdscpy(x,"a");
         test_cond("sdscpy() against an originally longer string",
-            sdslen(x) == 1 && memcmp(x,"a\0",2) == 0)
+            sdslen(x) == 1 && memcmp(x,"a\0",2) == 0);
 
         x = sdscpy(x,"xyzxxxxxxxxxxyyyyyyyyyykkkkkkkkkk");
         test_cond("sdscpy() against an originally shorter string",
             sdslen(x) == 33 &&
-            memcmp(x,"xyzxxxxxxxxxxyyyyyyyyyykkkkkkkkkk\0",33) == 0)
+            memcmp(x,"xyzxxxxxxxxxxyyyyyyyyyykkkkkkkkkk\0",33) == 0);
 
         sdsfree(x);
         x = sdscatprintf(sdsempty(),"%d",123);
         test_cond("sdscatprintf() seems working in the base case",
-            sdslen(x) == 3 && memcmp(x,"123\0",4) == 0)
+            sdslen(x) == 3 && memcmp(x,"123\0",4) == 0);
 
         sdsfree(x);
         x = sdscatprintf(sdsempty(),"a%cb",0);
         test_cond("sdscatprintf() seems working with \\0 inside of result",
-            sdslen(x) == 3 && memcmp(x,"a\0""b\0",4) == 0)
+            sdslen(x) == 3 && memcmp(x,"a\0""b\0",4) == 0);
 
         {
             sdsfree(x);
@@ -1209,7 +1281,7 @@ int sdsTest(int argc, char **argv) {
             }
             x = sdscatprintf(sdsempty(),"%0*d",(int)sizeof(etalon),0);
             test_cond("sdscatprintf() can print 1MB",
-                sdslen(x) == sizeof(etalon) && memcmp(x,etalon,sizeof(etalon)) == 0)
+                sdslen(x) == sizeof(etalon) && memcmp(x,etalon,sizeof(etalon)) == 0);
         }
 
         sdsfree(x);
@@ -1218,7 +1290,7 @@ int sdsTest(int argc, char **argv) {
         test_cond("sdscatfmt() seems working in the base case",
             sdslen(x) == 60 &&
             memcmp(x,"--Hello Hi! World -9223372036854775808,"
-                     "9223372036854775807--",60) == 0)
+                     "9223372036854775807--",60) == 0);
         printf("[%s]\n",x);
 
         sdsfree(x);
@@ -1226,85 +1298,85 @@ int sdsTest(int argc, char **argv) {
         x = sdscatfmt(x, "%u,%U--", UINT_MAX, ULLONG_MAX);
         test_cond("sdscatfmt() seems working with unsigned numbers",
             sdslen(x) == 35 &&
-            memcmp(x,"--4294967295,18446744073709551615--",35) == 0)
+            memcmp(x,"--4294967295,18446744073709551615--",35) == 0);
 
         sdsfree(x);
         x = sdsnew(" x ");
         sdstrim(x," x");
         test_cond("sdstrim() works when all chars match",
-            sdslen(x) == 0)
+            sdslen(x) == 0);
 
         sdsfree(x);
         x = sdsnew(" x ");
         sdstrim(x," ");
         test_cond("sdstrim() works when a single char remains",
-            sdslen(x) == 1 && x[0] == 'x')
+            sdslen(x) == 1 && x[0] == 'x');
 
         sdsfree(x);
         x = sdsnew("xxciaoyyy");
         sdstrim(x,"xy");
         test_cond("sdstrim() correctly trims characters",
-            sdslen(x) == 4 && memcmp(x,"ciao\0",5) == 0)
+            sdslen(x) == 4 && memcmp(x,"ciao\0",5) == 0);
 
         y = sdsdup(x);
         sdsrange(y,1,1);
         test_cond("sdsrange(...,1,1)",
-            sdslen(y) == 1 && memcmp(y,"i\0",2) == 0)
+            sdslen(y) == 1 && memcmp(y,"i\0",2) == 0);
 
         sdsfree(y);
         y = sdsdup(x);
         sdsrange(y,1,-1);
         test_cond("sdsrange(...,1,-1)",
-            sdslen(y) == 3 && memcmp(y,"iao\0",4) == 0)
+            sdslen(y) == 3 && memcmp(y,"iao\0",4) == 0);
 
         sdsfree(y);
         y = sdsdup(x);
         sdsrange(y,-2,-1);
         test_cond("sdsrange(...,-2,-1)",
-            sdslen(y) == 2 && memcmp(y,"ao\0",3) == 0)
+            sdslen(y) == 2 && memcmp(y,"ao\0",3) == 0);
 
         sdsfree(y);
         y = sdsdup(x);
         sdsrange(y,2,1);
         test_cond("sdsrange(...,2,1)",
-            sdslen(y) == 0 && memcmp(y,"\0",1) == 0)
+            sdslen(y) == 0 && memcmp(y,"\0",1) == 0);
 
         sdsfree(y);
         y = sdsdup(x);
         sdsrange(y,1,100);
         test_cond("sdsrange(...,1,100)",
-            sdslen(y) == 3 && memcmp(y,"iao\0",4) == 0)
+            sdslen(y) == 3 && memcmp(y,"iao\0",4) == 0);
 
         sdsfree(y);
         y = sdsdup(x);
         sdsrange(y,100,100);
         test_cond("sdsrange(...,100,100)",
-            sdslen(y) == 0 && memcmp(y,"\0",1) == 0)
+            sdslen(y) == 0 && memcmp(y,"\0",1) == 0);
 
         sdsfree(y);
         sdsfree(x);
         x = sdsnew("foo");
         y = sdsnew("foa");
-        test_cond("sdscmp(foo,foa)", sdscmp(x,y) > 0)
+        test_cond("sdscmp(foo,foa)", sdscmp(x,y) > 0);
 
         sdsfree(y);
         sdsfree(x);
         x = sdsnew("bar");
         y = sdsnew("bar");
-        test_cond("sdscmp(bar,bar)", sdscmp(x,y) == 0)
+        test_cond("sdscmp(bar,bar)", sdscmp(x,y) == 0);
 
         sdsfree(y);
         sdsfree(x);
         x = sdsnew("aar");
         y = sdsnew("bar");
-        test_cond("sdscmp(bar,bar)", sdscmp(x,y) < 0)
+        test_cond("sdscmp(bar,bar)", sdscmp(x,y) < 0);
 
         sdsfree(y);
         sdsfree(x);
         x = sdsnewlen("\a\n\0foo\r",7);
         y = sdscatrepr(sdsempty(),x,sdslen(x));
         test_cond("sdscatrepr(...data...)",
-            memcmp(y,"\"\\a\\n\\x00foo\\r\"",15) == 0)
+            memcmp(y,"\"\\a\\n\\x00foo\\r\"",15) == 0);
 
         {
             unsigned int oldfree;
@@ -1342,8 +1414,32 @@ int sdsTest(int argc, char **argv) {
 
             sdsfree(x);
         }
+
+        /* Simple template */
+        x = sdstemplate("v1={variable1} v2={variable2}", sdsTestTemplateCallback, NULL);
+        test_cond("sdstemplate() normal flow",
+                  memcmp(x,"v1=value1 v2=value2",19) == 0);
+        sdsfree(x);
+
+        /* Template with callback error */
+        x = sdstemplate("v1={variable1} v3={doesnotexist}", sdsTestTemplateCallback, NULL);
+        test_cond("sdstemplate() with callback error", x == NULL);
+
+        /* Template with empty var name */
+        x = sdstemplate("v1={", sdsTestTemplateCallback, NULL);
+        test_cond("sdstemplate() with empty var name", x == NULL);
+
+        /* Template with truncated var name */
+        x = sdstemplate("v1={start", sdsTestTemplateCallback, NULL);
+        test_cond("sdstemplate() with truncated var name", x == NULL);
+
+        /* Template with quoting */
+        x = sdstemplate("v1={{{variable1}} {{} v2={variable2}", sdsTestTemplateCallback, NULL);
+        test_cond("sdstemplate() with quoting",
+                  memcmp(x,"v1={value1} {} v2=value2",24) == 0);
+        sdsfree(x);
     }
-    test_report()
+    test_report();
     return 0;
 }
 #endif

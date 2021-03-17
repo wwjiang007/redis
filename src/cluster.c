@@ -47,7 +47,7 @@
 clusterNode *myself = NULL;
 
 clusterNode *createClusterNode(char *nodename, int flags);
-int clusterAddNode(clusterNode *node);
+void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(connection *conn);
 void clusterSendPing(clusterLink *link, int type);
@@ -398,7 +398,7 @@ int clusterLockConfig(char *filename) {
     /* To lock it, we need to open the file in a way it is created if
      * it does not exist, otherwise there is a race condition with other
      * processes. */
-    int fd = open(filename,O_WRONLY|O_CREAT,0644);
+    int fd = open(filename,O_WRONLY|O_CREAT|O_CLOEXEC,0644);
     if (fd == -1) {
         serverLog(LL_WARNING,
             "Can't open %s in order to acquire a lock: %s",
@@ -499,7 +499,7 @@ void clusterInit(void) {
     if (saveconf) clusterSaveConfigOrDie(1);
 
     /* We need a listening TCP port for our cluster messaging needs. */
-    server.cfd_count = 0;
+    server.cfd.count = 0;
 
     /* Port sanity check II
      * The other handshake port check is triggered too late to stop
@@ -509,23 +509,14 @@ void clusterInit(void) {
         serverLog(LL_WARNING, "Redis port number too high. "
                    "Cluster communication port is 10,000 port "
                    "numbers higher than your Redis port. "
-                   "Your Redis port number must be "
-                   "lower than 55535.");
+                   "Your Redis port number must be 55535 or less.");
         exit(1);
     }
-    if (listenToPort(port+CLUSTER_PORT_INCR,
-        server.cfd,&server.cfd_count) == C_ERR)
-    {
+    if (listenToPort(port+CLUSTER_PORT_INCR, &server.cfd) == C_ERR) {
         exit(1);
-    } else {
-        int j;
-
-        for (j = 0; j < server.cfd_count; j++) {
-            if (aeCreateFileEvent(server.el, server.cfd[j], AE_READABLE,
-                clusterAcceptHandler, NULL) == AE_ERR)
-                    serverPanic("Unrecoverable error creating Redis Cluster "
-                                "file event.");
-        }
+    }
+    if (createSocketAcceptHandler(&server.cfd, clusterAcceptHandler) != C_OK) {
+        serverPanic("Unrecoverable error creating Redis Cluster socket accept handler.");
     }
 
     /* The slots -> keys map is a radix tree. Initialize it here. */
@@ -779,6 +770,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->configEpoch = 0;
     node->flags = flags;
     memset(node->slots,0,sizeof(node->slots));
+    node->slots_info = NULL;
     node->numslots = 0;
     node->numslaves = 0;
     node->slaves = NULL;
@@ -961,12 +953,12 @@ void freeClusterNode(clusterNode *n) {
 }
 
 /* Add a node to the nodes hash table */
-int clusterAddNode(clusterNode *node) {
+void clusterAddNode(clusterNode *node) {
     int retval;
 
     retval = dictAdd(server.cluster->nodes,
             sdsnewlen(node->name,CLUSTER_NAMELEN), node);
-    return (retval == DICT_OK) ? C_OK : C_ERR;
+    serverAssert(retval == DICT_OK);
 }
 
 /* Remove a node from the cluster. The function performs the high level
@@ -2126,7 +2118,7 @@ int clusterProcessPacket(clusterLink *link) {
         /* Don't bother creating useless objects if there are no
          * Pub/Sub subscribers. */
         if (dictSize(server.pubsub_channels) ||
-           listLength(server.pubsub_patterns))
+           dictSize(server.pubsub_patterns))
         {
             channel_len = ntohl(hdr->data.publish.msg.channel_len);
             message_len = ntohl(hdr->data.publish.msg.message_len);
@@ -2164,7 +2156,7 @@ int clusterProcessPacket(clusterLink *link) {
         resetManualFailover();
         server.cluster->mf_end = now + CLUSTER_MF_TIMEOUT;
         server.cluster->mf_slave = sender;
-        pauseClients(now+(CLUSTER_MF_TIMEOUT*CLUSTER_MF_PAUSE_MULT));
+        pauseClients(now+(CLUSTER_MF_TIMEOUT*CLUSTER_MF_PAUSE_MULT),CLIENT_PAUSE_WRITE);
         serverLog(LL_WARNING,"Manual failover requested by replica %.40s.",
             sender->name);
         /* We need to send a ping message to the replica, as it would carry
@@ -2815,7 +2807,7 @@ void clusterPropagatePublish(robj *channel, robj *message) {
  * SLAVE node specific functions
  * -------------------------------------------------------------------------- */
 
-/* This function sends a FAILOVE_AUTH_REQUEST message to every node in order to
+/* This function sends a FAILOVER_AUTH_REQUEST message to every node in order to
  * see if there is the quorum for this slave instance to failover its failing
  * master.
  *
@@ -3421,9 +3413,8 @@ void clusterHandleSlaveMigration(int max_slaves) {
  * The function can be used both to initialize the manual failover state at
  * startup or to abort a manual failover in progress. */
 void resetManualFailover(void) {
-    if (server.cluster->mf_end && clientsArePaused()) {
-        server.clients_pause_end_time = 0;
-        clientsArePaused(); /* Just use the side effect of the function. */
+    if (server.cluster->mf_end) {
+        checkClientPauseTimeoutAndReturnIfPaused();
     }
     server.cluster->mf_end = 0; /* No manual failover in progress. */
     server.cluster->mf_can_start = 0;
@@ -4145,8 +4136,8 @@ sds clusterGenNodeDescription(clusterNode *node) {
     sds ci;
 
     /* Node coordinates */
-    ci = sdscatprintf(sdsempty(),"%.40s %s:%d@%d ",
-        node->name,
+    ci = sdscatlen(sdsempty(),node->name,CLUSTER_NAMELEN);
+    ci = sdscatfmt(ci," %s:%i@%i ",
         node->ip,
         node->port,
         node->cport);
@@ -4155,40 +4146,46 @@ sds clusterGenNodeDescription(clusterNode *node) {
     ci = representClusterNodeFlags(ci, node->flags);
 
     /* Slave of... or just "-" */
+    ci = sdscatlen(ci," ",1);
     if (node->slaveof)
-        ci = sdscatprintf(ci," %.40s ",node->slaveof->name);
+        ci = sdscatlen(ci,node->slaveof->name,CLUSTER_NAMELEN);
     else
-        ci = sdscatlen(ci," - ",3);
+        ci = sdscatlen(ci,"-",1);
 
     unsigned long long nodeEpoch = node->configEpoch;
     if (nodeIsSlave(node) && node->slaveof) {
         nodeEpoch = node->slaveof->configEpoch;
     }
     /* Latency from the POV of this node, config epoch, link status */
-    ci = sdscatprintf(ci,"%lld %lld %llu %s",
+    ci = sdscatfmt(ci," %I %I %U %s",
         (long long) node->ping_sent,
         (long long) node->pong_received,
         nodeEpoch,
         (node->link || node->flags & CLUSTER_NODE_MYSELF) ?
                     "connected" : "disconnected");
 
-    /* Slots served by this instance */
-    start = -1;
-    for (j = 0; j < CLUSTER_SLOTS; j++) {
-        int bit;
+    /* Slots served by this instance. If we already have slots info,
+     * append it diretly, otherwise, generate slots only if it has. */
+    if (node->slots_info) {
+        ci = sdscatsds(ci, node->slots_info);
+    } else if (node->numslots > 0) {
+        start = -1;
+        for (j = 0; j < CLUSTER_SLOTS; j++) {
+            int bit;
 
-        if ((bit = clusterNodeGetSlotBit(node,j)) != 0) {
-            if (start == -1) start = j;
-        }
-        if (start != -1 && (!bit || j == CLUSTER_SLOTS-1)) {
-            if (bit && j == CLUSTER_SLOTS-1) j++;
-
-            if (start == j-1) {
-                ci = sdscatprintf(ci," %d",start);
-            } else {
-                ci = sdscatprintf(ci," %d-%d",start,j-1);
+            if ((bit = clusterNodeGetSlotBit(node,j)) != 0) {
+                if (start == -1) start = j;
             }
-            start = -1;
+            if (start != -1 && (!bit || j == CLUSTER_SLOTS-1)) {
+                if (bit && j == CLUSTER_SLOTS-1) j++;
+
+                if (start == j-1) {
+                    ci = sdscatfmt(ci," %i",start);
+                } else {
+                    ci = sdscatfmt(ci," %i-%i",start,j-1);
+                }
+                start = -1;
+            }
         }
     }
 
@@ -4209,6 +4206,41 @@ sds clusterGenNodeDescription(clusterNode *node) {
     return ci;
 }
 
+/* Generate the slot topology for all nodes and store the string representation
+ * in the slots_info struct on the node. This is used to improve the efficiency
+ * of clusterGenNodesDescription() because it removes looping of the slot space
+ * for generating the slot info for each node individually. */
+void clusterGenNodesSlotsInfo(int filter) {
+    clusterNode *n = NULL;
+    int start = -1;
+
+    for (int i = 0; i <= CLUSTER_SLOTS; i++) {
+        /* Find start node and slot id. */
+        if (n == NULL) {
+            if (i == CLUSTER_SLOTS) break;
+            n = server.cluster->slots[i];
+            start = i;
+            continue;
+        }
+
+        /* Generate slots info when occur different node with start
+         * or end of slot. */
+        if (i == CLUSTER_SLOTS || n != server.cluster->slots[i]) {
+            if (!(n->flags & filter)) {
+                if (n->slots_info == NULL) n->slots_info = sdsempty();
+                if (start == i-1) {
+                    n->slots_info = sdscatfmt(n->slots_info," %i",start);
+                } else {
+                    n->slots_info = sdscatfmt(n->slots_info," %i-%i",start,i-1);
+                }
+            }
+            if (i == CLUSTER_SLOTS) break;
+            n = server.cluster->slots[i];
+            start = i;
+        }
+    }
+}
+
 /* Generate a csv-alike representation of the nodes we are aware of,
  * including the "myself" node, and return an SDS string containing the
  * representation (it is up to the caller to free it).
@@ -4226,6 +4258,9 @@ sds clusterGenNodesDescription(int filter) {
     dictIterator *di;
     dictEntry *de;
 
+    /* Generate all nodes slots info firstly. */
+    clusterGenNodesSlotsInfo(filter);
+
     di = dictGetSafeIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
@@ -4235,6 +4270,12 @@ sds clusterGenNodesDescription(int filter) {
         ci = sdscatsds(ci,ni);
         sdsfree(ni);
         ci = sdscatlen(ci,"\n",1);
+
+        /* Release slots info. */
+        if (node->slots_info) {
+            sdsfree(node->slots_info);
+            node->slots_info = NULL;
+        }
     }
     dictReleaseIterator(di);
     return ci;
@@ -4272,7 +4313,31 @@ int getSlotOrReply(client *c, robj *o) {
     return (int) slot;
 }
 
-void clusterReplyMultiBulkSlots(client *c) {
+void addNodeReplyForClusterSlot(client *c, clusterNode *node, int start_slot, int end_slot) {
+    int i, nested_elements = 3; /* slots (2) + master addr (1) */
+    void *nested_replylen = addReplyDeferredLen(c);
+    addReplyLongLong(c, start_slot);
+    addReplyLongLong(c, end_slot);
+    addReplyArrayLen(c, 3);
+    addReplyBulkCString(c, node->ip);
+    addReplyLongLong(c, node->port);
+    addReplyBulkCBuffer(c, node->name, CLUSTER_NAMELEN);
+
+    /* Remaining nodes in reply are replicas for slot range */
+    for (i = 0; i < node->numslaves; i++) {
+        /* This loop is copy/pasted from clusterGenNodeDescription()
+         * with modifications for per-slot node aggregation. */
+        if (nodeFailed(node->slaves[i])) continue;
+        addReplyArrayLen(c, 3);
+        addReplyBulkCString(c, node->slaves[i]->ip);
+        addReplyLongLong(c, node->slaves[i]->port);
+        addReplyBulkCBuffer(c, node->slaves[i]->name, CLUSTER_NAMELEN);
+        nested_elements++;
+    }
+    setDeferredArrayLen(c, nested_replylen, nested_elements);
+}
+
+void clusterReplyMultiBulkSlots(client * c) {
     /* Format: 1) 1) start slot
      *            2) end slot
      *            3) 1) master IP
@@ -4283,69 +4348,29 @@ void clusterReplyMultiBulkSlots(client *c) {
      *               3) node ID
      *           ... continued until done
      */
-
-    int num_masters = 0;
+    clusterNode *n = NULL;
+    int num_masters = 0, start = -1;
     void *slot_replylen = addReplyDeferredLen(c);
 
-    dictEntry *de;
-    dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
-    while((de = dictNext(di)) != NULL) {
-        clusterNode *node = dictGetVal(de);
-        int j = 0, start = -1;
-        int i, nested_elements = 0;
-
-        /* Skip slaves (that are iterated when producing the output of their
-         * master) and  masters not serving any slot. */
-        if (!nodeIsMaster(node) || node->numslots == 0) continue;
-
-        for(i = 0; i < node->numslaves; i++) {
-            if (nodeFailed(node->slaves[i])) continue;
-            nested_elements++;
+    for (int i = 0; i <= CLUSTER_SLOTS; i++) {
+        /* Find start node and slot id. */
+        if (n == NULL) {
+            if (i == CLUSTER_SLOTS) break;
+            n = server.cluster->slots[i];
+            start = i;
+            continue;
         }
 
-        for (j = 0; j < CLUSTER_SLOTS; j++) {
-            int bit, i;
-
-            if ((bit = clusterNodeGetSlotBit(node,j)) != 0) {
-                if (start == -1) start = j;
-            }
-            if (start != -1 && (!bit || j == CLUSTER_SLOTS-1)) {
-                addReplyArrayLen(c, nested_elements + 3); /* slots (2) + master addr (1). */
-
-                if (bit && j == CLUSTER_SLOTS-1) j++;
-
-                /* If slot exists in output map, add to it's list.
-                 * else, create a new output map for this slot */
-                if (start == j-1) {
-                    addReplyLongLong(c, start); /* only one slot; low==high */
-                    addReplyLongLong(c, start);
-                } else {
-                    addReplyLongLong(c, start); /* low */
-                    addReplyLongLong(c, j-1);   /* high */
-                }
-                start = -1;
-
-                /* First node reply position is always the master */
-                addReplyArrayLen(c, 3);
-                addReplyBulkCString(c, node->ip);
-                addReplyLongLong(c, node->port);
-                addReplyBulkCBuffer(c, node->name, CLUSTER_NAMELEN);
-
-                /* Remaining nodes in reply are replicas for slot range */
-                for (i = 0; i < node->numslaves; i++) {
-                    /* This loop is copy/pasted from clusterGenNodeDescription()
-                     * with modifications for per-slot node aggregation */
-                    if (nodeFailed(node->slaves[i])) continue;
-                    addReplyArrayLen(c, 3);
-                    addReplyBulkCString(c, node->slaves[i]->ip);
-                    addReplyLongLong(c, node->slaves[i]->port);
-                    addReplyBulkCBuffer(c, node->slaves[i]->name, CLUSTER_NAMELEN);
-                }
-                num_masters++;
-            }
+        /* Add cluster slots info when occur different node with start
+         * or end of slot. */
+        if (i == CLUSTER_SLOTS || n != server.cluster->slots[i]) {
+            addNodeReplyForClusterSlot(c, n, start, i-1);
+            num_masters++;
+            if (i == CLUSTER_SLOTS) break;
+            n = server.cluster->slots[i];
+            start = i;
         }
     }
-    dictReleaseIterator(di);
     setDeferredArrayLen(c, slot_replylen, num_masters);
 }
 
@@ -4357,28 +4382,49 @@ void clusterCommand(client *c) {
 
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
         const char *help[] = {
-"ADDSLOTS <slot> [slot ...] -- Assign slots to current node.",
-"BUMPEPOCH -- Advance the cluster config epoch.",
-"COUNT-failure-reports <node-id> -- Return number of failure reports for <node-id>.",
-"COUNTKEYSINSLOT <slot> - Return the number of keys in <slot>.",
-"DELSLOTS <slot> [slot ...] -- Delete slots information from current node.",
-"FAILOVER [force|takeover] -- Promote current replica node to being a master.",
-"FORGET <node-id> -- Remove a node from the cluster.",
-"GETKEYSINSLOT <slot> <count> -- Return key names stored by current node in a slot.",
-"FLUSHSLOTS -- Delete current node own slots information.",
-"INFO - Return information about the cluster.",
-"KEYSLOT <key> -- Return the hash slot for <key>.",
-"MEET <ip> <port> [bus-port] -- Connect nodes into a working cluster.",
-"MYID -- Return the node id.",
-"NODES -- Return cluster configuration seen by node. Output format:",
-"    <id> <ip:port> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ... <slot>",
-"REPLICATE <node-id> -- Configure current node as replica to <node-id>.",
-"RESET [hard|soft] -- Reset current node (default: soft).",
-"SET-config-epoch <epoch> - Set config epoch of current node.",
-"SETSLOT <slot> (importing|migrating|stable|node <node-id>) -- Set slot state.",
-"REPLICAS <node-id> -- Return <node-id> replicas.",
-"SAVECONFIG - Force saving cluster configuration on disk.",
-"SLOTS -- Return information about slots range mappings. Each range is made of:",
+"ADDSLOTS <slot> [<slot> ...]",
+"    Assign slots to current node.",
+"BUMPEPOCH",
+"    Advance the cluster config epoch.",
+"COUNT-FAILURE-REPORTS <node-id>",
+"    Return number of failure reports for <node-id>.",
+"COUNTKEYSINSLOT <slot>",
+"    Return the number of keys in <slot>.",
+"DELSLOTS <slot> [<slot> ...]",
+"    Delete slots information from current node.",
+"FAILOVER [FORCE|TAKEOVER]",
+"    Promote current replica node to being a master.",
+"FORGET <node-id>",
+"    Remove a node from the cluster.",
+"GETKEYSINSLOT <slot> <count>",
+"    Return key names stored by current node in a slot.",
+"FLUSHSLOTS",
+"    Delete current node own slots information.",
+"INFO",
+"    Return information about the cluster.",
+"KEYSLOT <key>",
+"    Return the hash slot for <key>.",
+"MEET <ip> <port> [<bus-port>]",
+"    Connect nodes into a working cluster.",
+"MYID",
+"    Return the node id.",
+"NODES",
+"    Return cluster configuration seen by node. Output format:",
+"    <id> <ip:port> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
+"REPLICATE <node-id>",
+"    Configure current node as replica to <node-id>.",
+"RESET [HARD|SOFT]",
+"    Reset current node (default: soft).",
+"SET-CONFIG-EPOCH <epoch>",
+"    Set config epoch of current node.",
+"SETSLOT <slot> (IMPORTING|MIGRATING|STABLE|NODE <node-id>)",
+"    Set slot state.",
+"REPLICAS <node-id>",
+"    Return <node-id> replicas.",
+"SAVECONFIG",
+"    Force saving cluster configuration on disk.",
+"SLOTS",
+"    Return information about slots range mappings. Each range is made of:",
 "    start, end, master and replicas IP addresses, ports and ids",
 NULL
         };
@@ -4820,7 +4866,7 @@ NULL
                 takeover = 1;
                 force = 1; /* Takeover also implies force. */
             } else {
-                addReply(c,shared.syntaxerr);
+                addReplyErrorObject(c,shared.syntaxerr);
                 return;
             }
         }
@@ -4911,7 +4957,7 @@ NULL
             } else if (!strcasecmp(c->argv[2]->ptr,"soft")) {
                 hard = 0;
             } else {
-                addReply(c,shared.syntaxerr);
+                addReplyErrorObject(c,shared.syntaxerr);
                 return;
             }
         }
@@ -5049,7 +5095,7 @@ void restoreCommand(client *c) {
             }
             j++; /* Consume additional arg. */
         } else {
-            addReply(c,shared.syntaxerr);
+            addReplyErrorObject(c,shared.syntaxerr);
             return;
         }
     }
@@ -5057,7 +5103,7 @@ void restoreCommand(client *c) {
     /* Make sure this key does not already exist here... */
     robj *key = c->argv[1];
     if (!replace && lookupKeyWrite(c->db,key) != NULL) {
-        addReply(c,shared.busykeyerr);
+        addReplyErrorObject(c,shared.busykeyerr);
         return;
     }
 
@@ -5170,8 +5216,7 @@ migrateCachedSocket* migrateGetSocket(client *c, robj *host, robj *port, long ti
     conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
     if (connBlockingConnect(conn, c->argv[1]->ptr, atoi(c->argv[2]->ptr), timeout)
             != C_OK) {
-        addReplySds(c,
-            sdsnew("-IOERR error or timeout connecting to the client\r\n"));
+        addReplyError(c,"-IOERR error or timeout connecting to the client");
         connClose(conn);
         sdsfree(name);
         return NULL;
@@ -5259,14 +5304,14 @@ void migrateCommand(client *c) {
             replace = 1;
         } else if (!strcasecmp(c->argv[j]->ptr,"auth")) {
             if (!moreargs) {
-                addReply(c,shared.syntaxerr);
+                addReplyErrorObject(c,shared.syntaxerr);
                 return;
             }
             j++;
             password = c->argv[j]->ptr;
         } else if (!strcasecmp(c->argv[j]->ptr,"auth2")) {
             if (moreargs < 2) {
-                addReply(c,shared.syntaxerr);
+                addReplyErrorObject(c,shared.syntaxerr);
                 return;
             }
             username = c->argv[++j]->ptr;
@@ -5282,7 +5327,7 @@ void migrateCommand(client *c) {
             num_keys = c->argc - j - 1;
             break; /* All the remaining args are keys. */
         } else {
-            addReply(c,shared.syntaxerr);
+            addReplyErrorObject(c,shared.syntaxerr);
             return;
         }
     }
@@ -5763,18 +5808,14 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
              * cluster is down. */
             if (error_code) *error_code = CLUSTER_REDIR_DOWN_STATE;
             return NULL;
-        } else if (!(cmd->flags & CMD_READONLY) && !(cmd->proc == evalCommand)
-                && !(cmd->proc == evalShaCommand))
-        {
-            /* The cluster is configured to allow read only commands
-             * but this command is neither readonly, nor EVAL or
-             * EVALSHA. */
+        } else if (cmd->flags & CMD_WRITE) {
+            /* The cluster is configured to allow read only commands */
             if (error_code) *error_code = CLUSTER_REDIR_DOWN_RO_STATE;
             return NULL;
         } else {
             /* Fall through and allow the command to be executed:
              * this happens when server.cluster_allow_reads_when_down is
-             * true and the command is a readonly command or EVAL / EVALSHA. */
+             * true and the command is not a write command */
         }
     }
 
@@ -5812,11 +5853,10 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     /* Handle the read-only client case reading from a slave: if this
      * node is a slave and the request is about a hash slot our master
      * is serving, we can reply without redirection. */
-    int is_readonly_command = (c->cmd->flags & CMD_READONLY) ||
-                              (c->cmd->proc == execCommand && !(c->mstate.cmd_inv_flags & CMD_READONLY));
+    int is_write_command = (c->cmd->flags & CMD_WRITE) ||
+                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
     if (c->flags & CLIENT_READONLY &&
-        (is_readonly_command || cmd->proc == evalCommand ||
-         cmd->proc == evalShaCommand) &&
+        !is_write_command &&
         nodeIsSlave(myself) &&
         myself->slaveof == n)
     {
@@ -5838,23 +5878,23 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
  * be set to the hash slot that caused the redirection. */
 void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_code) {
     if (error_code == CLUSTER_REDIR_CROSS_SLOT) {
-        addReplySds(c,sdsnew("-CROSSSLOT Keys in request don't hash to the same slot\r\n"));
+        addReplyError(c,"-CROSSSLOT Keys in request don't hash to the same slot");
     } else if (error_code == CLUSTER_REDIR_UNSTABLE) {
         /* The request spawns multiple keys in the same slot,
          * but the slot is not "stable" currently as there is
          * a migration or import in progress. */
-        addReplySds(c,sdsnew("-TRYAGAIN Multiple keys request during rehashing of slot\r\n"));
+        addReplyError(c,"-TRYAGAIN Multiple keys request during rehashing of slot");
     } else if (error_code == CLUSTER_REDIR_DOWN_STATE) {
-        addReplySds(c,sdsnew("-CLUSTERDOWN The cluster is down\r\n"));
+        addReplyError(c,"-CLUSTERDOWN The cluster is down");
     } else if (error_code == CLUSTER_REDIR_DOWN_RO_STATE) {
-        addReplySds(c,sdsnew("-CLUSTERDOWN The cluster is down and only accepts read commands\r\n"));
+        addReplyError(c,"-CLUSTERDOWN The cluster is down and only accepts read commands");
     } else if (error_code == CLUSTER_REDIR_DOWN_UNBOUND) {
-        addReplySds(c,sdsnew("-CLUSTERDOWN Hash slot not served\r\n"));
+        addReplyError(c,"-CLUSTERDOWN Hash slot not served");
     } else if (error_code == CLUSTER_REDIR_MOVED ||
                error_code == CLUSTER_REDIR_ASK)
     {
-        addReplySds(c,sdscatprintf(sdsempty(),
-            "-%s %d %s:%d\r\n",
+        addReplyErrorSds(c,sdscatprintf(sdsempty(),
+            "-%s %d %s:%d",
             (error_code == CLUSTER_REDIR_ASK) ? "ASK" : "MOVED",
             hashslot,n->ip,n->port));
     } else {
@@ -5901,7 +5941,7 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
             /* if the client is read-only and attempting to access key that our
              * replica can handle, allow it. */
             if ((c->flags & CLIENT_READONLY) &&
-                (c->lastcmd->flags & CMD_READONLY) &&
+                !(c->lastcmd->flags & CMD_WRITE) &&
                 nodeIsSlave(myself) && myself->slaveof == node)
             {
                 node = myself;

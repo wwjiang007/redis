@@ -217,6 +217,25 @@ start_server {tags {"acl"}} {
         set e
     } {*NOPERM*}
 
+    test {ACLs set can include subcommands, if already full command exists} {
+        r ACL setuser bob +memory|doctor
+        set cmdstr [dict get [r ACL getuser bob] commands]
+        assert_equal {-@all +memory|doctor} $cmdstr
+
+        # Validate the commands have got engulfed to +memory.
+        r ACL setuser bob +memory
+        set cmdstr [dict get [r ACL getuser bob] commands]
+        assert_equal {-@all +memory} $cmdstr
+
+        # Appending to the existing access string of bob.
+        r ACL setuser bob +@all +client|id
+        # Validate the new commands has got engulfed to +@all.
+        set cmdstr [dict get [r ACL getuser bob] commands]
+        assert_equal {+@all} $cmdstr
+        r CLIENT ID; # Should not fail
+        r MEMORY DOCTOR; # Should not fail
+    }
+
     # Note that the order of the generated ACL rules is not stable in Redis
     # so we need to match the different parts and not as a whole string.
     test {ACL GETUSER is able to translate back command permissions} {
@@ -389,6 +408,14 @@ start_server {tags {"acl"}} {
         r ACL setuser default on
         set e
     } {*NOAUTH*}
+
+    test {When default user has no command permission, hello command still works for other users} {
+        r ACL setuser secure-user >supass on +@all
+        r ACL setuser default -@all
+        r HELLO 2 AUTH secure-user supass
+        r ACL setuser default nopass +@all
+        r AUTH default ""
+    }
 
     test {ACL HELP should not have unexpected options} {
         catch {r ACL help xxx} e
