@@ -511,7 +511,7 @@ void geoaddCommand(client *c) {
  * GEOSEARCH key [FROMMEMBER member] [FROMLONLAT long lat] [BYRADIUS radius unit]
  *               [BYBOX width height unit] [WITHCORD] [WITHDIST] [WITHASH] [COUNT count [ANY]] [ASC|DESC]
  * GEOSEARCHSTORE dest_key src_key [FROMMEMBER member] [FROMLONLAT long lat] [BYRADIUS radius unit]
- *               [BYBOX width height unit] [WITHCORD] [WITHDIST] [WITHASH] [COUNT count [ANY]] [ASC|DESC] [STOREDIST]
+ *               [BYBOX width height unit] [COUNT count [ANY]] [ASC|DESC] [STOREDIST]
  *  */
 void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
     robj *storekey = NULL;
@@ -651,9 +651,9 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
 
     /* Trap options not compatible with STORE and STOREDIST. */
     if (storekey && (withdist || withhash || withcoords)) {
-        addReplyError(c,
-            "STORE option in GEORADIUS is not compatible with "
-            "WITHDIST, WITHHASH and WITHCOORDS options");
+        addReplyErrorFormat(c,
+            "%s is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
+            flags & GEOSEARCHSTORE? "GEOSEARCHSTORE": "STORE option in GEORADIUS");
         return;
     }
 

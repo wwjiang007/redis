@@ -406,15 +406,17 @@ static void parseRedisUri(const char *uri) {
     if (!strncasecmp(tlsscheme, curr, strlen(tlsscheme))) {
 #ifdef USE_OPENSSL
         config.tls = 1;
+        curr += strlen(tlsscheme);
 #else
         fprintf(stderr,"rediss:// is only supported when redis-cli is compiled with OpenSSL\n");
         exit(1);
 #endif
-    } else if (strncasecmp(scheme, curr, strlen(scheme))) {
+    } else if (!strncasecmp(scheme, curr, strlen(scheme))) {
+        curr += strlen(scheme);
+    } else {
         fprintf(stderr,"Invalid URI scheme\n");
         exit(1);
     }
-    curr += strlen(scheme);
     if (curr == end) return;
 
     /* Extract user info. */
@@ -472,13 +474,6 @@ void dictListDestructor(void *privdata, void *val)
 {
     DICT_NOTUSED(privdata);
     listRelease((list*)val);
-}
-
-/* _serverAssert is needed by dict */
-void _serverAssert(const char *estr, const char *file, int line) {
-    fprintf(stderr, "=== ASSERTION FAILED ===");
-    fprintf(stderr, "==> %s:%d '%s' is not true",file,line,estr);
-    *((char*)-1) = 'x';
 }
 
 /*------------------------------------------------------------------------------
@@ -661,7 +656,7 @@ static void cliOutputHelp(int argc, char **argv) {
         help = entry->org;
         if (group == -1) {
             /* Compare all arguments */
-            if (argc == entry->argc) {
+            if (argc <= entry->argc) {
                 for (j = 0; j < argc; j++) {
                     if (strcasecmp(argv[j],entry->argv[j]) != 0) break;
                 }
@@ -842,7 +837,9 @@ static int cliConnect(int flags) {
             cliRefreshPrompt();
         }
 
-        if (config.hostsocket == NULL) {
+        /* Do not use hostsocket when we got redirected in cluster mode */
+        if (config.hostsocket == NULL ||
+            (config.cluster_mode && config.cluster_reissue_command)) {
             context = redisConnect(config.hostip,config.hostport);
         } else {
             context = redisConnectUnix(config.hostsocket);
@@ -3366,7 +3363,7 @@ cleanup:
 
 /* Get the node the slot is assigned to from the point of view of node *n.
  * If the slot is unassigned or if the reply is an error, return NULL.
- * Use the **err argument in order to check wether the slot is unassigned
+ * Use the **err argument in order to check whether the slot is unassigned
  * or the reply resulted in an error. */
 static clusterManagerNode *clusterManagerGetSlotOwner(clusterManagerNode *n,
                                                       int slot, char **err)
@@ -7200,7 +7197,10 @@ static void getRDB(clusterManagerNode *node) {
     redisFree(s); /* Close the connection ASAP as fsync() may take time. */
     if (node)
         node->context = NULL;
-    fsync(fd);
+    if (fsync(fd) == -1) {
+        fprintf(stderr,"Fail to fsync '%s': %s\n", filename, strerror(errno));
+        exit(1);
+    }
     close(fd);
     if (node) {
         sdsfree(filename);
@@ -7412,8 +7412,14 @@ static int getDbSize(void) {
 
     reply = redisCommand(context, "DBSIZE");
 
-    if(reply == NULL || reply->type != REDIS_REPLY_INTEGER) {
-        fprintf(stderr, "Couldn't determine DBSIZE!\n");
+    if (reply == NULL) {
+        fprintf(stderr, "\nI/O error\n");
+        exit(1);
+    } else if (reply->type == REDIS_REPLY_ERROR) {
+        fprintf(stderr, "Couldn't determine DBSIZE: %s\n", reply->str);
+        exit(1);
+    } else if (reply->type != REDIS_REPLY_INTEGER) {
+        fprintf(stderr, "Non INTEGER response from DBSIZE!\n");
         exit(1);
     }
 
